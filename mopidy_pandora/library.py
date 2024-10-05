@@ -298,7 +298,7 @@ class PandoraLibraryProvider(backend.LibraryProvider):
             return []
 
         search_result = self.backend.api.search(
-            search_text, include_near_matches=False, include_genre_stations=True
+            search_text, include_near_matches=True, include_genre_stations=False
         )
 
         tracks = []
