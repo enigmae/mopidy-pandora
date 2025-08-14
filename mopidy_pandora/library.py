@@ -149,7 +149,7 @@ class PandoraLibraryProvider(backend.LibraryProvider):
                             image_uri = track.album_art_url
                     except KeyError:
                         logger.debug(f"Track not in cache for image lookup: '{uri}'.")
-                        return []
+                        continue  # Skip this URI, continue with others
                 elif isinstance(pandora_uri, StationUri):
                     # GenreStations don't appear to have artwork available via the
                     # json API
