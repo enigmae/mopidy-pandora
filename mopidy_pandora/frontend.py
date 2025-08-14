@@ -100,7 +100,8 @@ class PandoraFrontend(
         self.keep_alive_timer = None
         self.keep_alive_enabled = self.config.get("keep_alive_enabled", True)
         self.keep_alive_interval = self.config.get("keep_alive_interval", 1800)  # 30 minutes default
-        logger.info(f"PandoraFrontend: Keep-alive initialized - enabled={self.keep_alive_enabled}, interval={self.keep_alive_interval}s")
+        self.keep_alive_double_skip = self.config.get("keep_alive_double_skip", False)
+        logger.info(f"PandoraFrontend: Keep-alive initialized - enabled={self.keep_alive_enabled}, interval={self.keep_alive_interval}s, double_skip={self.keep_alive_double_skip}")
     
     def on_stop(self):
         """Clean up when the frontend is stopped."""
@@ -272,56 +273,132 @@ class PandoraFrontend(
         """Trigger a keep-alive by skipping to the next track while paused."""
         logger.info("PandoraFrontend: Triggering keep-alive by skipping track")
         
+        import time
         current_state = None
         original_volume = None
+        
         try:
             # Check if we're paused
             current_state = self.core.playback.get_state().get()
             
-            if current_state == 'paused':
-                # Save current volume and mute to prevent accidental audio
-                original_volume = self.core.mixer.get_volume().get()
-                logger.debug(f"PandoraFrontend: Saving volume {original_volume} and muting")
+            if current_state != 'paused':
+                logger.debug("PandoraFrontend: Not paused, skipping keep-alive")
+                return
+            
+            # Step 1: Mute with retry logic
+            original_volume = self.core.mixer.get_volume().get()
+            logger.info(f"PandoraFrontend: Saving volume {original_volume} and muting")
+            
+            mute_success = False
+            for attempt in range(3):
                 self.core.mixer.set_volume(0).get()
+                time.sleep(2 * (attempt + 1))  # Exponential backoff: 2, 4, 6 seconds
                 
-                # Skip to next track - this refreshes track URLs
-                logger.info("PandoraFrontend: Skipping to next track to refresh session")
+                current_vol = self.core.mixer.get_volume().get()
+                if current_vol == 0:
+                    mute_success = True
+                    logger.debug(f"PandoraFrontend: Mute successful on attempt {attempt + 1}")
+                    break
+                else:
+                    logger.warning(f"PandoraFrontend: Mute attempt {attempt + 1} failed, volume is {current_vol}")
+            
+            if not mute_success:
+                logger.error("PandoraFrontend: Failed to mute after 3 attempts, aborting keep-alive")
+                return
+            
+            # Step 2: Skip track with verification
+            logger.info("PandoraFrontend: Skipping to next track to refresh session")
+            current_track = self.core.playback.get_current_track().get()
+            
+            # Perform first skip
+            self.core.playback.next().get()
+            time.sleep(3)
+            
+            # Check if we should do double skip
+            if self.keep_alive_double_skip:
+                logger.info("PandoraFrontend: Performing double skip as configured")
                 self.core.playback.next().get()
-                
-                # Give it a moment to process the skip
-                import time
-                time.sleep(0.5)
-                
-                # Check state after skip - sometimes it auto-plays
-                new_state = self.core.playback.get_state().get()
-                if new_state == 'playing':
-                    logger.info("PandoraFrontend: Playback started after skip, pausing again")
+                time.sleep(3)
+            else:
+                # Verify skip happened
+                new_track = self.core.playback.get_current_track().get()
+                if current_track and new_track and current_track.uri == new_track.uri:
+                    logger.warning("PandoraFrontend: First skip didn't change track, trying again")
+                    self.core.playback.next().get()
+                    time.sleep(3)
+            
+            # Step 3: Ensure we're paused (with retries)
+            for attempt in range(3):
+                state = self.core.playback.get_state().get()
+                if state == 'playing':
+                    logger.info(f"PandoraFrontend: Playback is playing (attempt {attempt + 1}), pausing")
                     self.core.playback.pause().get()
+                    time.sleep(2)
+                elif state == 'paused':
+                    logger.debug("PandoraFrontend: Confirmed paused state")
+                    break
+                else:
+                    logger.warning(f"PandoraFrontend: Unexpected state: {state}")
+                    time.sleep(2)
+            
+            # Step 4: Verify still muted before unmuting
+            current_vol = self.core.mixer.get_volume().get()
+            if current_vol != 0:
+                logger.warning(f"PandoraFrontend: Volume changed to {current_vol} during operation, re-muting")
+                self.core.mixer.set_volume(0).get()
+                time.sleep(1)
+            
+            # Step 5: Final state check before unmuting
+            final_state = self.core.playback.get_state().get()
+            if final_state != 'paused':
+                logger.error(f"PandoraFrontend: Final state is {final_state}, not unmuting for safety")
+                # Try one more pause
+                self.core.playback.pause().get()
+                time.sleep(2)
+                final_state = self.core.playback.get_state().get()
+            
+            # Step 6: Restore volume only if safe
+            if final_state == 'paused' and original_volume is not None:
+                logger.info(f"PandoraFrontend: Safe to restore volume to {original_volume}")
                 
-                # Restore original volume
-                if original_volume is not None:
-                    logger.debug(f"PandoraFrontend: Restoring volume to {original_volume}")
+                for attempt in range(3):
                     self.core.mixer.set_volume(original_volume).get()
-                
-                logger.info("PandoraFrontend: Keep-alive skip completed")
-                
-                # Restart the timer for the next interval
+                    time.sleep(1)
+                    restored_vol = self.core.mixer.get_volume().get()
+                    if restored_vol == original_volume:
+                        logger.debug(f"PandoraFrontend: Volume restored successfully")
+                        break
+                    else:
+                        logger.warning(f"PandoraFrontend: Volume restore attempt {attempt + 1} failed")
+            else:
+                logger.warning(f"PandoraFrontend: Not restoring volume, final state is {final_state}")
+            
+            logger.info("PandoraFrontend: Keep-alive skip completed")
+            
+        except Exception as e:
+            logger.error(f"PandoraFrontend: Keep-alive failed with exception: {e}")
+            # Emergency: ensure we're muted if anything went wrong
+            try:
+                if original_volume is not None:
+                    current_vol = self.core.mixer.get_volume().get()
+                    if current_vol > 0:
+                        logger.info("PandoraFrontend: Emergency mute due to exception")
+                        self.core.mixer.set_volume(0).get()
+                        # Try to pause as well
+                        self.core.playback.pause().get()
+            except:
+                pass
+        
+        finally:
+            # Always restart the timer if we're still in pause mode
+            try:
+                final_check = self.core.playback.get_state().get()
+                if self.keep_alive_enabled and final_check == 'paused':
+                    self._start_keep_alive_timer()
+            except:
+                # If we can't even check state, restart timer anyway
                 if self.keep_alive_enabled:
                     self._start_keep_alive_timer()
-            else:
-                logger.debug("PandoraFrontend: Not paused, skipping keep-alive")
-                
-        except Exception as e:
-            logger.error(f"PandoraFrontend: Keep-alive failed: {e}")
-            # Restore volume on error
-            if original_volume is not None:
-                try:
-                    self.core.mixer.set_volume(original_volume).get()
-                except:
-                    pass
-            # Restart the timer even on error
-            if self.keep_alive_enabled and current_state == 'paused':
-                self._start_keep_alive_timer()
 
 
 @total_ordering
