@@ -83,6 +83,8 @@ class Extension(ext.Extension):
                 "delete_station",
             ]
         )
+        schema["keep_alive_enabled"] = config.Boolean(optional=True)
+        schema["keep_alive_interval"] = config.Integer(minimum=300, optional=True)
         return schema
 
     def setup(self, registry):

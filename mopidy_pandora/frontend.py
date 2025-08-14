@@ -95,6 +95,17 @@ class PandoraFrontend(
 
         self.track_change_completed_event = threading.Event()
         self.track_change_completed_event.set()
+        
+        # Keep-alive timer attributes
+        self.keep_alive_timer = None
+        self.keep_alive_enabled = self.config.get("keep_alive_enabled", True)
+        self.keep_alive_interval = self.config.get("keep_alive_interval", 1800)  # 30 minutes default
+        logger.info(f"PandoraFrontend: Keep-alive initialized - enabled={self.keep_alive_enabled}, interval={self.keep_alive_interval}s")
+    
+    def on_stop(self):
+        """Clean up when the frontend is stopped."""
+        self._stop_keep_alive_timer()
+        super().on_stop() if hasattr(super(), 'on_stop') else None
 
     def set_options(self):
         # Setup playback to mirror behaviour of official Pandora front-ends.
@@ -136,10 +147,15 @@ class PandoraFrontend(
         if not self.track_change_completed_event.is_set():
             self.track_change_completed_event.set()
             self.update_tracklist(tl_track.track)
+        # Start keep-alive timer when paused
+        if self.keep_alive_enabled:
+            self._start_keep_alive_timer()
 
     @only_execute_for_pandora_uris
     def track_playback_resumed(self, tl_track, time_position):
         self.set_options()
+        # Stop keep-alive timer when resumed
+        self._stop_keep_alive_timer()
 
     def is_end_of_tracklist_reached(self, track=None):
         length = self.core.tracklist.get_length().get()
@@ -236,6 +252,48 @@ class PandoraFrontend(
             station_id=station_id,
             auto_play=auto_play,
         )
+    
+    def _start_keep_alive_timer(self):
+        """Start the keep-alive timer when playback is paused."""
+        self._stop_keep_alive_timer()  # Cancel any existing timer
+        logger.info(f"PandoraFrontend: Starting keep-alive timer with {self.keep_alive_interval}s interval")
+        self.keep_alive_timer = threading.Timer(self.keep_alive_interval, self._trigger_keep_alive)
+        self.keep_alive_timer.daemon = True
+        self.keep_alive_timer.start()
+    
+    def _stop_keep_alive_timer(self):
+        """Stop the keep-alive timer."""
+        if self.keep_alive_timer:
+            logger.info("PandoraFrontend: Stopping keep-alive timer")
+            self.keep_alive_timer.cancel()
+            self.keep_alive_timer = None
+    
+    def _trigger_keep_alive(self):
+        """Trigger a keep-alive by skipping to the next track while paused."""
+        logger.info("PandoraFrontend: Triggering keep-alive by skipping track")
+        
+        current_state = None
+        try:
+            # Check if we're paused
+            current_state = self.core.playback.get_state().get()
+            
+            if current_state == 'paused':
+                # Skip to next track - this refreshes track URLs
+                logger.info("PandoraFrontend: Skipping to next track to refresh session")
+                self.core.playback.next().get()
+                logger.info("PandoraFrontend: Keep-alive skip completed")
+                
+                # Restart the timer for the next interval
+                if self.keep_alive_enabled:
+                    self._start_keep_alive_timer()
+            else:
+                logger.debug("PandoraFrontend: Not paused, skipping keep-alive")
+                
+        except Exception as e:
+            logger.error(f"PandoraFrontend: Keep-alive failed: {e}")
+            # Restart the timer even on error
+            if self.keep_alive_enabled and current_state == 'paused':
+                self._start_keep_alive_timer()
 
 
 @total_ordering
