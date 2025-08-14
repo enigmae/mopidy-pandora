@@ -273,14 +273,36 @@ class PandoraFrontend(
         logger.info("PandoraFrontend: Triggering keep-alive by skipping track")
         
         current_state = None
+        original_volume = None
         try:
             # Check if we're paused
             current_state = self.core.playback.get_state().get()
             
             if current_state == 'paused':
+                # Save current volume and mute to prevent accidental audio
+                original_volume = self.core.mixer.get_volume().get()
+                logger.debug(f"PandoraFrontend: Saving volume {original_volume} and muting")
+                self.core.mixer.set_volume(0).get()
+                
                 # Skip to next track - this refreshes track URLs
                 logger.info("PandoraFrontend: Skipping to next track to refresh session")
                 self.core.playback.next().get()
+                
+                # Give it a moment to process the skip
+                import time
+                time.sleep(0.5)
+                
+                # Check state after skip - sometimes it auto-plays
+                new_state = self.core.playback.get_state().get()
+                if new_state == 'playing':
+                    logger.info("PandoraFrontend: Playback started after skip, pausing again")
+                    self.core.playback.pause().get()
+                
+                # Restore original volume
+                if original_volume is not None:
+                    logger.debug(f"PandoraFrontend: Restoring volume to {original_volume}")
+                    self.core.mixer.set_volume(original_volume).get()
+                
                 logger.info("PandoraFrontend: Keep-alive skip completed")
                 
                 # Restart the timer for the next interval
@@ -291,6 +313,12 @@ class PandoraFrontend(
                 
         except Exception as e:
             logger.error(f"PandoraFrontend: Keep-alive failed: {e}")
+            # Restore volume on error
+            if original_volume is not None:
+                try:
+                    self.core.mixer.set_volume(original_volume).get()
+                except:
+                    pass
             # Restart the timer even on error
             if self.keep_alive_enabled and current_state == 'paused':
                 self._start_keep_alive_timer()
