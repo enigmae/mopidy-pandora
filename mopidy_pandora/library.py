@@ -34,9 +34,10 @@ class PandoraLibraryProvider(backend.LibraryProvider):
         name=GENRE_DIR_NAME, uri=PandoraUri("genres").uri
     )
 
-    def __init__(self, backend, sort_order):
+    def __init__(self, backend, sort_order, log_cache_misses=False):
         super().__init__(backend)
         self.sort_order = sort_order.lower()
+        self.log_cache_misses = log_cache_misses
 
         self.pandora_station_cache = StationCache(self, maxsize=5)
         self.pandora_track_cache = LRUCache(maxsize=10)
@@ -79,7 +80,8 @@ class PandoraLibraryProvider(backend.LibraryProvider):
             try:
                 track = self.lookup_pandora_track(uri)
             except KeyError:
-                logger.exception(f"Failed to lookup Pandora URI '{uri}'.")
+                if self.log_cache_misses:
+                    logger.debug(f"Track not in cache, skipping lookup for URI '{uri}'.")
                 return []
             else:
                 if isinstance(pandora_uri, AdItemUri):
@@ -141,11 +143,16 @@ class PandoraLibraryProvider(backend.LibraryProvider):
                 if isinstance(pandora_uri, AdItemUri) or isinstance(
                     pandora_uri, TrackUri
                 ):
-                    track = self.lookup_pandora_track(uri)
-                    if track.is_ad is True:
-                        image_uri = track.image_url
-                    else:
-                        image_uri = track.album_art_url
+                    try:
+                        track = self.lookup_pandora_track(uri)
+                        if track.is_ad is True:
+                            image_uri = track.image_url
+                        else:
+                            image_uri = track.album_art_url
+                    except KeyError:
+                        if self.log_cache_misses:
+                            logger.debug(f"Track not in cache for image lookup: '{uri}'.")
+                        continue  # Skip this URI, continue with others
                 elif isinstance(pandora_uri, StationUri):
                     # GenreStations don't appear to have artwork available via the
                     # json API
@@ -250,7 +257,10 @@ class PandoraLibraryProvider(backend.LibraryProvider):
         ]
 
     def lookup_pandora_track(self, uri):
-        return self.pandora_track_cache[uri].track
+        if uri in self.pandora_track_cache:
+            return self.pandora_track_cache[uri].track
+        else:
+            raise KeyError(f"Track not found in cache: {uri}")
 
     def get_next_pandora_track(self, station_id):
         try:

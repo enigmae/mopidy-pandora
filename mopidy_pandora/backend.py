@@ -39,7 +39,9 @@ class PandoraBackend(
             settings, client_class=MopidyAPIClient
         ).build()
         self.library = PandoraLibraryProvider(
-            backend=self, sort_order=self.config.get("sort_order")
+            backend=self, 
+            sort_order=self.config.get("sort_order"),
+            log_cache_misses=self.config.get("log_cache_misses", False)
         )
         self.playback = PandoraPlaybackProvider(audio, self)
         self.uri_schemes = [PandoraUri.SCHEME]
