@@ -358,6 +358,40 @@ class PandoraLibraryProvider(backend.LibraryProvider):
         search_text = " ".join(search_text)
         return search_text
 
+    def invalidate_station(self, station_id):
+        """Invalidate cached iterator and tracks for a given station.
+
+        This removes the station entry from the station cache and purges any
+        cached track entries (including ads) associated with the station.
+        Best-effort and safe if entries are missing.
+        """
+        try:
+            # Drop iterator so next fetch gets a fresh playlist
+            self.pandora_station_cache.pop(station_id)
+        except KeyError:
+            pass
+
+        # Remove cached tracks for this station
+        try:
+            to_delete = []
+            for uri in list(self.pandora_track_cache.keys()):
+                try:
+                    pandora_uri = PandoraUri.factory(uri)
+                    # Track and AdItem URIs both provide station_id
+                    if hasattr(pandora_uri, "station_id") and pandora_uri.station_id == station_id:
+                        to_delete.append(uri)
+                except Exception:
+                    # Ignore malformed/unsupported URIs
+                    continue
+            for uri in to_delete:
+                try:
+                    del self.pandora_track_cache[uri]
+                except KeyError:
+                    pass
+        except Exception:
+            # Defensive: never let cache purging break caller
+            logger.exception("Error invalidating cached tracks for station '%s'.", station_id)
+
 
 class StationCache(LRUCache):
     def __init__(self, library, maxsize, getsizeof=None):
