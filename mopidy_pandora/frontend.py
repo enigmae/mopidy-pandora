@@ -102,6 +102,10 @@ class PandoraFrontend(
         self.keep_alive_interval = self.config.get("keep_alive_interval", 1800)  # 30 minutes default
         self.keep_alive_double_skip = self.config.get("keep_alive_double_skip", False)
         logger.info(f"PandoraFrontend: Keep-alive initialized - enabled={self.keep_alive_enabled}, interval={self.keep_alive_interval}s, double_skip={self.keep_alive_double_skip}")
+        # Ad/account/paused state tracking (best-effort, minimal change)
+        self.account_ad_supported = None  # None=unknown, True=free/ad-supported, False=premium
+        self.paused_at = None
+        self.keepalive_attempts_in_pause = 0
     
     def on_stop(self):
         """Clean up when the frontend is stopped."""
@@ -137,6 +141,14 @@ class PandoraFrontend(
         if not self.track_change_completed_event.is_set():
             self.track_change_completed_event.set()
             self.update_tracklist(tl_track.track)
+        # Detect ads to infer ad-supported accounts
+        try:
+            pandora_uri = PandoraUri.factory(tl_track.track.uri)
+            if isinstance(pandora_uri, AdItemUri) and self.account_ad_supported is not True:
+                self.account_ad_supported = True
+                logger.info("PandoraFrontend: Detected ad during playback start; inferring ad-supported account.")
+        except Exception:
+            pass
 
     @only_execute_for_pandora_uris
     def track_playback_ended(self, tl_track, time_position):
@@ -151,12 +163,23 @@ class PandoraFrontend(
         # Start keep-alive timer when paused
         if self.keep_alive_enabled:
             self._start_keep_alive_timer()
+        # Mark pause start time for policy decisions
+        try:
+            if self.paused_at is None:
+                import time as _time
+                self.paused_at = int(_time.time())
+                self.keepalive_attempts_in_pause = 0
+        except Exception:
+            pass
 
     @only_execute_for_pandora_uris
     def track_playback_resumed(self, tl_track, time_position):
         self.set_options()
         # Stop keep-alive timer when resumed
         self._stop_keep_alive_timer()
+        # Clear pause session state
+        self.paused_at = None
+        self.keepalive_attempts_in_pause = 0
 
     def is_end_of_tracklist_reached(self, track=None):
         length = self.core.tracklist.get_length().get()
@@ -271,11 +294,12 @@ class PandoraFrontend(
     
     def _trigger_keep_alive(self):
         """Trigger a keep-alive by skipping to the next track while paused."""
-        logger.info("PandoraFrontend: Triggering keep-alive by skipping track")
+        logger.info("PandoraFrontend: Keep-alive timer fired")
         
         import time
         current_state = None
         original_volume = None
+        previous_uri = None
         
         try:
             # Check if we're paused
@@ -284,6 +308,51 @@ class PandoraFrontend(
             if current_state != 'paused':
                 logger.debug("PandoraFrontend: Not paused, skipping keep-alive")
                 return
+            # Determine current track and URI
+            current_track = self.core.playback.get_current_track().get()
+            if not current_track or not current_track.uri:
+                logger.debug("PandoraFrontend: No current track, skipping keep-alive")
+                return
+            previous_uri = current_track.uri
+            if not PandoraUri.is_pandora_uri(previous_uri):
+                logger.debug("PandoraFrontend: Current URI not a Pandora URI; skipping keep-alive")
+                return
+
+            # Parse Pandora URI and update ad-supported heuristic
+            try:
+                parsed_uri = PandoraUri.factory(previous_uri)
+                is_ad_current = isinstance(parsed_uri, AdItemUri)
+                if is_ad_current and self.account_ad_supported is not True:
+                    self.account_ad_supported = True
+                    logger.info("PandoraFrontend: Detected ad during keep-alive; inferring ad-supported account.")
+            except Exception:
+                parsed_uri = None
+                is_ad_current = False
+
+            # Compute paused duration best-effort
+            paused_seconds = 0
+            if self.paused_at:
+                try:
+                    paused_seconds = max(0, int(time.time()) - int(self.paused_at))
+                except Exception:
+                    paused_seconds = 0
+
+            # Apply free/ad-supported policy only; keep premium behavior unchanged
+            if self.account_ad_supported is True:
+                # If paused on an ad at timer -> reset session to avoid expired ad URL
+                if is_ad_current and parsed_uri is not None:
+                    logger.info("PandoraFrontend: Paused on ad at keep-alive; resetting session for free account.")
+                    self._kill_session_and_reset(parsed_uri.station_id)
+                    return
+                # Not an ad; allow one safe refresh under 60 minutes, else reset
+                if not is_ad_current and self.keepalive_attempts_in_pause == 0 and paused_seconds < 3600:
+                    logger.info("PandoraFrontend: Free account first keep-alive attempt <60min; attempting one safe refresh.")
+                    # proceed to skip
+                else:
+                    if parsed_uri is not None:
+                        logger.info("PandoraFrontend: Free account exceeded attempt/time window; resetting session.")
+                        self._kill_session_and_reset(parsed_uri.station_id)
+                    return
             
             # Step 1: Mute with retry logic
             original_volume = self.core.mixer.get_volume().get()
@@ -308,7 +377,7 @@ class PandoraFrontend(
             
             # Step 2: Skip track with verification
             logger.info("PandoraFrontend: Skipping to next track to refresh session")
-            current_track = self.core.playback.get_current_track().get()
+            # previous_uri set above if needed for verification
             
             # Perform first skip
             self.core.playback.next().get()
@@ -322,7 +391,7 @@ class PandoraFrontend(
             else:
                 # Verify skip happened
                 new_track = self.core.playback.get_current_track().get()
-                if current_track and new_track and current_track.uri == new_track.uri:
+                if previous_uri and new_track and previous_uri == new_track.uri:
                     logger.warning("PandoraFrontend: First skip didn't change track, trying again")
                     self.core.playback.next().get()
                     time.sleep(3)
@@ -374,6 +443,9 @@ class PandoraFrontend(
                 logger.warning(f"PandoraFrontend: Not restoring volume, final state is {final_state}")
             
             logger.info("PandoraFrontend: Keep-alive skip completed")
+            # Mark attempt for free-tier policy
+            if self.account_ad_supported is True:
+                self.keepalive_attempts_in_pause = 1
             
         except Exception as e:
             logger.error(f"PandoraFrontend: Keep-alive failed with exception: {e}")
@@ -388,6 +460,17 @@ class PandoraFrontend(
                         self.core.playback.pause().get()
             except:
                 pass
+            # If free tier and past interval, reset session on failure
+            try:
+                if previous_uri and self.account_ad_supported is True and self.paused_at:
+                    paused_seconds = max(0, int(time.time()) - int(self.paused_at))
+                    if paused_seconds >= self.keep_alive_interval:
+                        parsed_uri = PandoraUri.factory(previous_uri)
+                        logger.info("PandoraFrontend: Keep-alive failure after interval on free account; resetting session.")
+                        self._kill_session_and_reset(parsed_uri.station_id)
+                        return
+            except Exception:
+                pass
         
         finally:
             # Always restart the timer if we're still in pause mode
@@ -399,6 +482,30 @@ class PandoraFrontend(
                 # If we can't even check state, restart timer anyway
                 if self.keep_alive_enabled:
                     self._start_keep_alive_timer()
+
+    def _kill_session_and_reset(self, station_id):
+        """Stop playback, clear tracklist, and invalidate station caches (best-effort)."""
+        try:
+            # Stop playback
+            try:
+                self.core.playback.stop().get()
+            except Exception:
+                pass
+            # Clear tracklist
+            try:
+                self.core.tracklist.clear().get()
+            except Exception:
+                pass
+            # Invalidate station in library
+            try:
+                self.backend.library.invalidate_station(station_id)
+            except Exception:
+                logger.exception("PandoraFrontend: Failed to invalidate station cache for %s", station_id)
+            # Reset pause session counters
+            self.paused_at = None
+            self.keepalive_attempts_in_pause = 0
+        except Exception:
+            logger.exception("PandoraFrontend: Error during session reset")
 
 
 @total_ordering
