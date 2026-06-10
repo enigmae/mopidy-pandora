@@ -133,6 +133,18 @@ The following configuration values are available:
   players. Setting this to ``0`` will disable caching completely and ensure that the latest lists are always retrieved
   directly from the Pandora server. Defaults to ``86400`` (i.e. 24 hours).
 
+- ``pandora/keep_alive_enabled``: when enabled, the extension keeps a paused
+  station's session token alive by briefly skipping to the next track on a
+  timer. These skips make blocking calls into Mopidy core and can stall the
+  server, so this is **disabled by default**. Defaults to ``false``.
+
+- ``pandora/pause_refresh_interval``: the number of seconds a station may stay
+  paused before a resume recalls the station and re-queues a fresh playlist
+  (Pandora stream URLs expire while paused). When a station is resumed within
+  this interval, playback resumes normally; once the interval has elapsed, the
+  station is reloaded so that the user resumes on a live stream rather than an
+  expired one. Defaults to ``600`` (i.e. 10 minutes).
+
 It is also possible to apply Pandora ratings and perform other actions on the currently playing track using the standard
 pause/play/previous/next buttons.
 
