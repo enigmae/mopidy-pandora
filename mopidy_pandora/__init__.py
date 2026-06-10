@@ -86,6 +86,9 @@ class Extension(ext.Extension):
         schema["keep_alive_enabled"] = config.Boolean(optional=True)
         schema["keep_alive_interval"] = config.Integer(minimum=300, optional=True)
         schema["keep_alive_double_skip"] = config.Boolean(optional=True)
+        # Seconds a Pandora station may stay paused before a resume triggers a
+        # fresh re-queue of the station instead of resuming a stale stream.
+        schema["pause_refresh_interval"] = config.Integer(minimum=60, optional=True)
         schema["log_cache_misses"] = config.Boolean(optional=True)
         return schema
 

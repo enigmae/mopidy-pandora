@@ -96,15 +96,26 @@ class PandoraFrontend(
         self.track_change_completed_event = threading.Event()
         self.track_change_completed_event.set()
         
-        # Keep-alive timer attributes
+        # Legacy keep-alive auto-skip. Disabled by default: skipping to the next
+        # track while paused (to keep the Pandora session token alive) can block
+        # the Mopidy server. The pause/resume refresh below replaces it.
         self.keep_alive_timer = None
-        self.keep_alive_enabled = self.config.get("keep_alive_enabled", True)
+        self.keep_alive_enabled = self.config.get("keep_alive_enabled", False)
         self.keep_alive_interval = self.config.get("keep_alive_interval", 1800)  # 30 minutes default
         self.keep_alive_double_skip = self.config.get("keep_alive_double_skip", False)
-        logger.info(f"PandoraFrontend: Keep-alive initialized - enabled={self.keep_alive_enabled}, interval={self.keep_alive_interval}s, double_skip={self.keep_alive_double_skip}")
+        # Pause/resume refresh: when a station has been paused for at least this
+        # many seconds, a resume recalls the station and re-queues a fresh
+        # playlist instead of resuming a (likely expired) stream.
+        self.pause_refresh_interval = self.config.get("pause_refresh_interval", 600)  # 10 minutes default
+        logger.info(
+            f"PandoraFrontend: keep_alive_enabled={self.keep_alive_enabled}, "
+            f"keep_alive_interval={self.keep_alive_interval}s, "
+            f"pause_refresh_interval={self.pause_refresh_interval}s"
+        )
         # Ad/account/paused state tracking (best-effort, minimal change)
         self.account_ad_supported = None  # None=unknown, True=free/ad-supported, False=premium
         self.paused_at = None
+        self.paused_station_id = None
         self.keepalive_attempts_in_pause = 0
     
     def on_stop(self):
@@ -160,26 +171,50 @@ class PandoraFrontend(
         if not self.track_change_completed_event.is_set():
             self.track_change_completed_event.set()
             self.update_tracklist(tl_track.track)
-        # Start keep-alive timer when paused
+        # Record when (and which station) playback was paused so a later resume
+        # can decide whether to refresh a stale session.
+        try:
+            self.paused_at = int(time.time())
+            self.paused_station_id = PandoraUri.factory(
+                tl_track.track.uri
+            ).station_id
+            self.keepalive_attempts_in_pause = 0
+        except Exception:
+            self.paused_station_id = None
+        # Legacy keep-alive auto-skip (disabled by default).
         if self.keep_alive_enabled:
             self._start_keep_alive_timer()
-        # Mark pause start time for policy decisions
-        try:
-            if self.paused_at is None:
-                import time as _time
-                self.paused_at = int(_time.time())
-                self.keepalive_attempts_in_pause = 0
-        except Exception:
-            pass
 
     @only_execute_for_pandora_uris
     def track_playback_resumed(self, tl_track, time_position):
         self.set_options()
-        # Stop keep-alive timer when resumed
+        # Stop any legacy keep-alive timer.
         self._stop_keep_alive_timer()
-        # Clear pause session state
+
+        # Decide whether the paused session is stale and needs a fresh re-queue.
+        paused_seconds = 0
+        if self.paused_at:
+            try:
+                paused_seconds = max(0, int(time.time()) - int(self.paused_at))
+            except Exception:
+                paused_seconds = 0
+        station_id = self.paused_station_id
+
+        # Clear pause state up front so the re-queue's own pause/resume/play
+        # events don't re-enter this logic.
         self.paused_at = None
+        self.paused_station_id = None
         self.keepalive_attempts_in_pause = 0
+
+        if station_id and paused_seconds >= self.pause_refresh_interval:
+            logger.info(
+                "PandoraFrontend: resumed after %ss paused (>= %ss threshold); "
+                "recalling station %s with a fresh playlist.",
+                paused_seconds,
+                self.pause_refresh_interval,
+                station_id,
+            )
+            self._refresh_station_after_pause(station_id)
 
     def is_end_of_tracklist_reached(self, track=None):
         length = self.core.tracklist.get_length().get()
@@ -276,7 +311,38 @@ class PandoraFrontend(
             station_id=station_id,
             auto_play=auto_play,
         )
-    
+
+    @run_async
+    def _refresh_station_after_pause(self, station_id):
+        """Recall the recently-played station and re-queue a fresh track.
+
+        Runs on a worker thread so the frontend actor is never blocked. Stops
+        playback and clears the tracklist, then asks the backend to drop its
+        cached playlist for the station and queue a fresh, playable track
+        (auto-played). The backend owns the library/cache, so the actual reload
+        happens there via the ``reload_station`` listener event.
+        """
+        try:
+            self.core.playback.stop().get()
+        except Exception:
+            logger.exception(
+                "PandoraFrontend: error stopping playback during station refresh."
+            )
+        try:
+            self.core.tracklist.clear().get()
+        except Exception:
+            logger.exception(
+                "PandoraFrontend: error clearing tracklist during station refresh."
+            )
+        self._trigger_reload_station(station_id, auto_play=True)
+
+    def _trigger_reload_station(self, station_id, auto_play=True):
+        listener.PandoraFrontendListener.send(
+            "reload_station",
+            station_id=station_id,
+            auto_play=auto_play,
+        )
+
     def _start_keep_alive_timer(self):
         """Start the keep-alive timer when playback is paused."""
         self._stop_keep_alive_timer()  # Cancel any existing timer

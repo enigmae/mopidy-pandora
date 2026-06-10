@@ -77,6 +77,21 @@ class PandoraFrontendListener(listener.Listener):
         """
         pass
 
+    def reload_station(self, station_id, auto_play=False):
+        """
+        Called when a Pandora station that has been paused for longer than
+        ``pause_refresh_interval`` is resumed. The backend should invalidate any
+        cached playlist for the station and queue a fresh, playable track so the
+        user resumes on a live stream rather than an expired one.
+
+        :param station_id: the ID of the station to reload.
+        :type station_id: string
+        :param auto_play: specifies if the fresh track should be played as soon
+            as it is added to the tracklist.
+        :type auto_play: boolean
+        """
+        pass
+
 
 class PandoraBackendListener(backend.BackendListener):
 

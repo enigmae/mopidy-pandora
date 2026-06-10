@@ -52,6 +52,26 @@ class PandoraBackend(
     def end_of_tracklist_reached(self, station_id=None, auto_play=False):
         self.prepare_next_track(station_id, auto_play)
 
+    def reload_station(self, station_id=None, auto_play=True):
+        """Drop the cached playlist for a station and queue a fresh track.
+
+        Triggered by the frontend when a station is resumed after a long pause,
+        so the user gets a live stream URL instead of an expired one.
+        """
+        if not station_id:
+            return
+        logger.info(
+            "Reloading Pandora station '%s' with a fresh playlist after pause.",
+            station_id,
+        )
+        try:
+            self.library.invalidate_station(station_id)
+        except Exception:
+            logger.exception(
+                "Error invalidating station '%s' during reload.", station_id
+            )
+        self.prepare_next_track(station_id, auto_play)
+
     def prepare_next_track(self, station_id, auto_play=False):
         self._trigger_next_track_available(
             self.library.get_next_pandora_track(station_id), auto_play
